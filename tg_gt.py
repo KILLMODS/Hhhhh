@@ -36,7 +36,7 @@ ADMIN_IDS = [7459502130]
 TG_API_ID = int(os.environ.get("TG_API_ID", "30973996"))
 TG_API_HASH = os.environ.get("TG_API_HASH", "dc58ef881ea53b1faafcf6ad974306a7")
 
-SUPPORT_USERNAME = "@your_support"
+SUPPORT_USERNAME = "@ghytara1488"
 SUPPORT_TEXT = "Если у вас возникли вопросы, напишите нам."
 SUPPORT_HOURS = "Пн–Вс, 10:00 – 22:00 (МСК)"
 

